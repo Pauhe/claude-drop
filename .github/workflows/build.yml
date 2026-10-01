@@ -1,0 +1,130 @@
+name: Build
+
+# Builds the image in CI so the host pulls a tagged artefact instead of
+# building from a local working copy. The
+# runner is GitHub-hosted on purpose: nothing here deploys, it only pushes to
+# GHCR, so no self-hosted runner with a Docker socket needs to exist.
+#
+# Actions are pinned to commit SHAs, not tags. A tag can be moved onto other
+# code, which is how the Trivy action's own supply chain was compromised
+# earlier this year; Dependabot updates SHA pins the same as version pins.
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+  packages: write
+
+env:
+  IMAGE: ghcr.io/pauhe/claude-drop
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - uses: docker/setup-buildx-action@37fe631027851001ddb9b187196cc803df7f5f0e # v4.3.0
+
+      # Same image the suites run in locally, from the same Dockerfile, so a
+      # green run here means the same thing as a green run on the host.
+      - name: Build the test image
+        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0
+        with:
+          context: server
+          file: server/Dockerfile.dev
+          load: true
+          tags: claude-drop-dev:latest
+          cache-from: type=gha,scope=dev
+          cache-to: type=gha,mode=max,scope=dev
+
+      - name: Server tests
+        run: |
+          docker run --rm -v "$PWD/server:/src" -w /src \
+            claude-drop-dev:latest python -m pytest -q
+
+      - name: CLI tests
+        run: |
+          docker run --rm -v "$PWD/cli:/src" -w /src \
+            claude-drop-dev:latest python -m pytest -q
+
+      # Runs from the repo root, where install.sh copies cli/drop and
+      # skill/SKILL.md instead of fetching them over HTTP.
+      - name: Installer test
+        run: |
+          docker run --rm -v "$PWD:/src" -w /src \
+            claude-drop-dev:latest sh tests/test_install.sh
+
+  build:
+    needs: test
+    if: success() && github.event_name == 'push'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - uses: docker/setup-buildx-action@37fe631027851001ddb9b187196cc803df7f5f0e # v4.3.0
+
+      - name: Log in to GHCR
+        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Image tags
+        id: meta
+        uses: docker/metadata-action@dc802804100637a589fabce1cb79ff13a1411302 # v6.2.0
+        with:
+          images: ${{ env.IMAGE }}
+          tags: |
+            type=raw,value=latest,enable={{is_default_branch}}
+            type=sha,format=long
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+
+      # Built locally first so the scan below gets a veto. Pushing first would
+      # move the `latest` tag before anything had looked at the image, and a
+      # red run does not un-publish a tag the host is about to pull.
+      - name: Build
+        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0
+        with:
+          context: .
+          load: true
+          # A fixed local tag as well: the scan needs a name that exists on
+          # every trigger, and `latest` is only minted on the default branch.
+          tags: |
+            claude-drop:ci
+            ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      # The decoder accepts uploads from every tailnet device without
+      # authentication, so a fixable high-severity CVE fails the build rather
+      # than waiting in Dependabot's queue — and Dependabot does not see these
+      # at all, since they sit in transitive dependencies and in the base
+      # image rather than in requirements.txt. Unfixed findings are reported
+      # but do not block: there is nothing to upgrade to.
+      - name: Scan
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+        with:
+          image-ref: claude-drop:ci
+          severity: CRITICAL,HIGH
+          ignore-unfixed: true
+          exit-code: "1"
+          format: table
+
+      # Layers are in the cache by now, so this re-runs in seconds.
+      - name: Push
+        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0
+        with:
+          context: .
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha

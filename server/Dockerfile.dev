@@ -1,0 +1,13 @@
+# Test runner. The host has Python 3.12 without pip and is PEP-668 managed, so
+# the suite runs in the same runtime the service is deployed on rather than in
+# a hand-patched host environment.
+FROM python:3.13-slim
+
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends libheif1 \
+ && rm -rf /var/lib/apt/lists/*
+
+COPY requirements.txt /tmp/requirements.txt
+RUN pip install --no-cache-dir -r /tmp/requirements.txt
+
+WORKDIR /src

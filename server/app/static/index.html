@@ -1,0 +1,146 @@
+<!doctype html>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>drop</title>
+<style>
+  :root { color-scheme: light dark; --line: color-mix(in oklab, currentColor 18%, transparent); }
+  body { margin: 0 auto; padding: 1rem; max-width: 44rem; font: 16px/1.5 system-ui, sans-serif; }
+  h1 { font-size: .95rem; letter-spacing: .06em; text-transform: uppercase; opacity: .55; }
+  #zone { border: 2px dashed var(--line); border-radius: .75rem; padding: 2rem 1rem; text-align: center; }
+  #zone.hot { border-style: solid; }
+  .actions { display: flex; gap: .75rem; justify-content: center; flex-wrap: wrap; margin-top: 1rem; }
+  button, label.button, a.button { font: inherit; padding: .7rem 1.1rem; border-radius: .6rem;
+    border: 1px solid var(--line); background: none; cursor: pointer; text-decoration: none; color: inherit; }
+  .hint { opacity: .6; font-size: .875rem; }
+  #sentence { display: none; margin-top: 1rem; padding: .75rem; border: 1px solid var(--line); border-radius: .6rem; }
+  #sentence code { word-break: break-all; }
+  ul { list-style: none; padding: 0; }
+  li { display: flex; gap: .75rem; align-items: center; padding: .5rem 0; border-top: 1px solid var(--line); }
+  li img { width: 56px; height: 56px; object-fit: cover; border-radius: .35rem; background: var(--line); }
+  li .meta { flex: 1; min-width: 0; }
+  li .name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  li .when { opacity: .6; font-size: .8rem; }
+  .bad { color: #c0392b; }
+  .good { opacity: .75; }
+</style>
+
+<h1>drop</h1>
+
+<div id="zone">
+  <p><strong>Foto aufnehmen, Datei wählen, hierher ziehen — oder Strg+V</strong></p>
+  <p class="hint">Screenshot in der Zwischenablage? Tab hierher, Strg+V.</p>
+  <div class="actions">
+    <label class="button">Foto aufnehmen
+      <input id="camera" type="file" accept="image/*" capture="environment" multiple hidden></label>
+    <label class="button">Dateien wählen
+      <input id="picker" type="file" multiple hidden></label>
+  </div>
+</div>
+
+<ul id="receipts"></ul>
+
+<div id="sentence">
+  <p class="hint">Sag das deiner Claude-Session:</p>
+  <code id="sentence-text"></code>
+  <div class="actions"><button id="copy">Kopieren</button></div>
+</div>
+
+<h1>Zuletzt</h1>
+<ul id="recent"></ul>
+
+<script>
+const $ = (id) => document.getElementById(id);
+
+function receipt(text, cls) {
+  const item = document.createElement("li");
+  item.className = cls;
+  item.textContent = text;
+  $("receipts").append(item);
+}
+
+async function send(files) {
+  if (!files.length) return;
+  // Reset per attempt: a previous batch sentence must never survive into a
+  // run where nothing was accepted.
+  $("sentence").style.display = "none";
+  $("receipts").textContent = "";
+
+  const body = new FormData();
+  for (const file of files) body.append("files", file, file.name || "clipboard.png");
+
+  let result;
+  try {
+    const response = await fetch("/api/uploads", { method: "POST", body });
+    if (!response.ok) throw new Error(`HTTP ${response.status}`);
+    result = await response.json();
+  } catch (error) {
+    receipt(`Upload fehlgeschlagen: ${error.message}`, "bad");
+    return;
+  }
+
+  for (const ok of result.accepted) receipt(`${ok.filename} — ${ok.kind}`, "good");
+  for (const bad of result.rejected) receipt(`${bad.filename}: ${bad.error}`, "bad");
+
+  if (result.accepted.length) {
+    $("sentence").style.display = "block";
+    $("sentence-text").textContent = `die Bilder liegen als drop batch ${result.batch}`;
+  }
+  await refresh();
+}
+
+async function refresh() {
+  // order=desc: the API is ascending, so a plain limit would fetch the
+  // oldest forty and reversing them locally would not help.
+  const { drops } = await (await fetch("/api/drops?limit=40&order=desc")).json();
+  const list = $("recent");
+  list.textContent = "";
+  for (const drop of drops) {
+    const item = document.createElement("li");
+    if (drop.variants.includes("view_jpg")) {
+      const img = document.createElement("img");
+      img.src = `/api/drops/${drop.id}/view_jpg`;
+      img.alt = "";
+      item.append(img);
+    }
+    const meta = document.createElement("div");
+    meta.className = "meta";
+    const name = document.createElement("div");
+    name.className = "name";
+    name.textContent = drop.filename;
+    const when = document.createElement("div");
+    when.className = "when";
+    when.textContent = `${new Date(drop.created_at).toLocaleString("de-DE")} · batch ${drop.batch}`
+      + (drop.kind === "failed" ? " · nicht lesbar" : "");
+    meta.append(name, when);
+
+    const original = document.createElement("a");
+    original.className = "button";
+    original.href = `/api/drops/${drop.id}/orig`;
+    original.textContent = "Original";
+
+    const remove = document.createElement("button");
+    remove.textContent = "Löschen";
+    remove.onclick = async () => {
+      await fetch(`/api/drops/${drop.id}`, { method: "DELETE" });
+      refresh();
+    };
+    item.append(meta, original, remove);
+    list.append(item);
+  }
+}
+
+$("camera").onchange = (e) => send([...e.target.files]);
+$("picker").onchange = (e) => send([...e.target.files]);
+$("copy").onclick = () => navigator.clipboard.writeText($("sentence-text").textContent);
+
+const zone = $("zone");
+zone.addEventListener("dragover", (e) => { e.preventDefault(); zone.classList.add("hot"); });
+zone.addEventListener("dragleave", () => zone.classList.remove("hot"));
+zone.addEventListener("drop", (e) => {
+  e.preventDefault(); zone.classList.remove("hot"); send([...e.dataTransfer.files]);
+});
+// The Windows desktop case: screenshot to clipboard, switch tab, Ctrl+V.
+document.addEventListener("paste", (e) => send([...e.clipboardData.files]));
+
+refresh();
+</script>

@@ -1,0 +1,10 @@
+.git/
+docs/
+server/tests/
+server/Dockerfile.dev
+cli/tests/
+tests/
+__pycache__/
+*.pyc
+.pytest_cache/
+.venv/

@@ -1,0 +1,436 @@
+#!/usr/bin/env python3
+"""drop — fetch images uploaded to claude-drop onto this machine.
+
+Standard library only, on purpose: this runs on every VM, and none of them
+should need pip, a venv or a package manager to make it work.
+
+Output contract: one absolute path per drop on stdout, a summary on stderr.
+Claude feeds those paths straight into its file reader.
+"""
+
+from __future__ import annotations
+
+import argparse
+import fcntl
+import json
+import os
+import re
+import shutil
+import sys
+import tempfile
+import urllib.error
+import urllib.parse
+import urllib.request
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
+from zoneinfo import ZoneInfo
+
+LOCAL_TZ = ZoneInfo("Europe/Berlin")
+READABLE = {"image/jpeg", "image/png", "image/gif", "image/webp"}
+UNSAFE = re.compile(r"[^A-Za-z0-9._-]+")
+VARIANTS = ("orig", "view_jpg", "view_png", "full_jpg")
+
+
+def home() -> Path:
+    return Path(os.environ.get("HOME") or Path.home())
+
+
+def drop_dir() -> Path:
+    return home() / "drop"
+
+
+def state_dir() -> Path:
+    return home() / ".local" / "state" / "claude-drop"
+
+
+def base_url() -> str:
+    if url := os.environ.get("DROP_URL"):
+        return url.rstrip("/")
+    config = home() / ".config" / "claude-drop" / "config"
+    if config.exists():
+        for line in config.read_text().splitlines():
+            key, _, value = line.partition("=")
+            if key.strip() == "url" and value.strip():
+                return value.strip().rstrip("/")
+    return ""
+
+
+def api(path: str, params: dict | None = None) -> dict:
+    query = f"?{urllib.parse.urlencode(params)}" if params else ""
+    with urllib.request.urlopen(f"{base_url()}{path}{query}", timeout=30) as resp:
+        return json.load(resp)
+
+
+def fetch(drop_id: str, variant: str, target: Path) -> None:
+    """Download one variant, verified and fsynced.
+
+    copyfileobj alone would happily publish a truncated body as a complete
+    file: a connection cut mid-transfer looks exactly like a short file.
+    """
+    url = f"{base_url()}/api/drops/{drop_id}/{variant}"
+    with urllib.request.urlopen(url, timeout=120) as resp:
+        declared = resp.headers.get("Content-Length")
+        with open(target, "wb") as out:
+            shutil.copyfileobj(resp, out)
+            out.flush()
+            os.fsync(out.fileno())
+    if declared is not None and target.stat().st_size != int(declared):
+        raise OSError(f"{drop_id}/{variant}: got {target.stat().st_size} bytes, "
+                      f"expected {declared}")
+
+
+def extension_for(drop: dict, variant: str) -> str:
+    """A real extension, including for `orig`, which otherwise gets none."""
+    if variant in ("view_jpg", "full_jpg"):
+        return ".jpg"
+    if variant == "view_png":
+        return ".png"
+    from_type = {"image/jpeg": ".jpg", "image/png": ".png", "image/gif": ".gif",
+                 "image/webp": ".webp", "image/heic": ".heic",
+                 "image/tiff": ".tiff", "image/bmp": ".bmp",
+                 "application/pdf": ".pdf"}.get(drop["media_type"])
+    if from_type:
+        return from_type
+    suffix = UNSAFE.sub("", Path(drop["filename"]).suffix)[:10]
+    return f".{suffix.lstrip('.')}" if suffix.strip(".") else ".bin"
+
+
+def primary_variant(drop: dict, full: bool) -> str:
+    """One variant per drop (C2).
+
+    --full must be full resolution AND readable: full_jpg exists exactly when
+    the original is not directly usable, so this pair always is both. Falling
+    back to a 2000 px view would be readable but not full.
+    """
+    if full:
+        if "full_jpg" in drop["variants"]:
+            return "full_jpg"
+        return "orig"
+    for candidate in ("view_png", "view_jpg"):
+        if candidate in drop["variants"]:
+            return candidate
+    return "orig"
+
+
+def sanitise(name: str) -> str:
+    cleaned = UNSAFE.sub("-", Path(name).name).strip("-.")
+    return (cleaned or "drop")[:60]
+
+
+def immutable_name(drop: dict, variant: str) -> str:
+    stamp = drop["created_at"][:19].replace(":", "").replace("-", "")
+    stem = sanitise(f"{stamp}-{drop['id'][:12]}-{variant}-"
+                    f"{Path(drop['filename']).stem}")
+    return stem + extension_for(drop, variant)
+
+
+def read_cursor() -> int:
+    path = state_dir() / "cursor"
+    try:
+        return int(json.loads(path.read_text())["seq"])
+    except (OSError, ValueError, KeyError, json.JSONDecodeError):
+        return 0
+
+
+def write_cursor(seq: int) -> None:
+    state_dir().mkdir(parents=True, exist_ok=True)
+    target = state_dir() / "cursor"
+    temp = target.with_suffix(".tmp")
+    with open(temp, "w") as handle:
+        handle.write(json.dumps({"seq": seq}))
+        handle.flush()
+        os.fsync(handle.fileno())
+    os.replace(temp, target)
+    _fsync_dir(state_dir())
+
+
+def _fsync_dir(path: Path) -> None:
+    fd = os.open(path, os.O_RDONLY)
+    try:
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+
+
+def parse_since(value: str, fail) -> datetime:
+    """2h, 45m, 3d, HH:MM, or an ISO timestamp. Local time is Europe/Berlin."""
+    now = datetime.now(LOCAL_TZ)
+    if match := re.fullmatch(r"(\d+)([mhd])", value):
+        amount, unit = int(match[1]), match[2]
+        return now - {"m": timedelta(minutes=amount),
+                      "h": timedelta(hours=amount),
+                      "d": timedelta(days=amount)}[unit]
+    if match := re.fullmatch(r"(\d{1,2}):(\d{2})", value):
+        hour, minute = int(match[1]), int(match[2])
+        if hour > 23 or minute > 59:
+            fail(f"{value} is not a time of day")
+        candidate = now.replace(hour=hour, minute=minute, second=0, microsecond=0)
+        if candidate > now:
+            fail(f"{value} is in the future")
+        return candidate
+    try:
+        parsed = datetime.fromisoformat(value)
+    except ValueError:
+        fail(f"cannot read a time from {value!r}")
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=LOCAL_TZ)
+    if parsed > now:
+        fail(f"{value} is in the future")
+    return parsed
+
+
+def pages(params: dict, page_size: int) -> tuple[list[dict], int]:
+    """Consume every page up to one fixed boundary (C6).
+
+    The boundary is captured from the first page and passed back as max_seq,
+    so a drop arriving mid-pagination is left for the next pull instead of
+    extending this one indefinitely.
+    """
+    collected: list[dict] = []
+    first = api("/api/drops", dict(params, limit=page_size))
+    boundary = first["snapshot_max_seq"]
+    collected += first["drops"]
+    while collected and collected[-1]["seq"] < boundary:
+        page = api("/api/drops", dict(params, limit=page_size, max_seq=boundary,
+                                      after_seq=collected[-1]["seq"]))
+        if not page["drops"]:
+            break
+        collected += page["drops"]
+    return collected, boundary
+
+
+def collect(args, fail) -> tuple[list[dict], int | None]:
+    """Return drops to fetch, and the cursor to store on success.
+
+    None means "do not touch the cursor": only a bare `drop pull` is
+    incremental. Sharing it with --since or --batch would let a historical
+    pull rewind the next incremental one.
+    """
+    if args.id:
+        drops, _ = pages({}, args.page_size)
+        return [d for d in drops if d["id"] == args.id], None
+    if args.batch:
+        return pages({"batch": args.batch}, args.page_size)[0], None
+    if args.last:
+        drops, _ = pages({}, args.page_size)
+        return drops[-args.last:], None
+    if args.since or args.today:
+        moment = (datetime.now(LOCAL_TZ).replace(hour=0, minute=0, second=0,
+                                                 microsecond=0)
+                  if args.today else parse_since(args.since, fail))
+        since = moment.astimezone(timezone.utc).isoformat()
+        return pages({"since": since}, args.page_size)[0], None
+
+    cursor = read_cursor()
+    params = {"after_seq": cursor} if cursor else {}
+    return pages(params, args.page_size)
+
+
+def cmd_list(args, fail) -> int:
+    params = {"limit": args.limit, "order": "desc"}
+    if args.since:
+        params["since"] = parse_since(args.since, fail).astimezone(
+            timezone.utc).isoformat()
+    for drop in api("/api/drops", params)["drops"]:
+        # The full id, because --id requires exactly this string.
+        print(f"{drop['id']}  {drop['created_at']}  batch {drop['batch']}  "
+              f"{drop['kind']:7}  {drop['filename']}")
+    return 0
+
+
+def build_parser() -> argparse.ArgumentParser:
+    def positive(value: str) -> int:
+        number = int(value)
+        if number < 1:
+            raise argparse.ArgumentTypeError("must be 1 or more")
+        return number
+
+    parser = argparse.ArgumentParser(prog="drop")
+    sub = parser.add_subparsers(dest="command", required=True)
+
+    p = sub.add_parser("pull", help="fetch drops into ~/drop")
+    selection = p.add_mutually_exclusive_group()
+    selection.add_argument("--batch", help="one upload batch, from the web page")
+    selection.add_argument("--id", help="a single drop id")
+    selection.add_argument("--since", help="2h, 45m, 3d, 14:00 or an ISO timestamp")
+    selection.add_argument("--today", action="store_true")
+    selection.add_argument("--last", type=positive, metavar="N")
+    p.add_argument("--full", action="store_true",
+                   help="full resolution, in a format Claude can read")
+    p.add_argument("--print0", action="store_true")
+    p.add_argument("--page-size", type=positive, default=100)
+    p.set_defaults(handler=pull)
+
+    lister = sub.add_parser("list", help="show drops without downloading")
+    lister.add_argument("--since")
+    lister.add_argument("--limit", type=positive, default=50)
+    lister.set_defaults(handler=cmd_list)
+    return parser
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = build_parser()
+    args = parser.parse_args(argv)
+    fail = parser.error          # exits 2, which is the usage contract (C11)
+    url = base_url()
+    if not url:
+        fail("no service URL: set DROP_URL or put url=https://... in "
+             "~/.config/claude-drop/config")
+    if urllib.parse.urlsplit(url).scheme not in ("http", "https") or "://" not in url:
+        fail(f"service URL must start with http:// or https://, got {url!r}")
+    try:
+        return args.handler(args, fail)
+    except urllib.error.URLError as error:
+        print(f"drop: cannot reach {base_url()}: {error}", file=sys.stderr)
+        return 1
+
+
+def stage_companions(staging: Path,
+                     staged: list[tuple[Path, dict, str]]) -> dict[str, Path] | None:
+    """Download the latest.* pair into staging, before anything is published.
+
+    Companions are chosen from the drop's VARIANTS, never from a local
+    filename suffix: whether the newest image has a lossless form is a
+    property of the drop. An earlier version inspected the suffix, so an
+    `orig` file — which carried no extension at all — matched neither branch
+    and deleted a perfectly current latest.png.
+
+    Returns None when the batch holds no image at all, which is different
+    from an image that has no lossless variant: the first must leave
+    latest.* untouched, the second must remove a now-stale latest.png.
+    """
+    newest = next(((path, drop, variant) for path, drop, variant in reversed(staged)
+                   if drop["kind"] == "image"), None)
+    if newest is None:
+        return None
+    primary_path, drop, variant = newest
+
+    companions: dict[str, Path] = {}
+    # Reuse what is already downloaded when its format fits. On a --full pull
+    # of a HEIC the primary is already a JPEG, so latest.jpg is that file —
+    # the full-resolution one the user asked for, and no second request.
+    primary_suffix = extension_for(drop, variant)
+    if primary_suffix == ".jpg":
+        companions["latest.jpg"] = staging / "companion.jpg"
+        shutil.copy2(primary_path, companions["latest.jpg"])
+    elif primary_suffix == ".png":
+        companions["latest.png"] = staging / "companion.png"
+        shutil.copy2(primary_path, companions["latest.png"])
+
+    if "latest.jpg" not in companions and "view_jpg" in drop["variants"]:
+        target = staging / "companion.jpg"
+        fetch(drop["id"], "view_jpg", target)
+        companions["latest.jpg"] = target
+    if "latest.png" not in companions and "view_png" in drop["variants"]:
+        target = staging / "companion.png"
+        fetch(drop["id"], "view_png", target)
+        companions["latest.png"] = target
+    return companions
+
+
+def publish(staged: list[tuple[Path, dict, str]], staging: Path,
+            companions: dict[str, Path] | None) -> list[Path]:
+    """Make a fully staged batch visible.
+
+    Every byte — the per-drop files and both latest.* companions — is already
+    on disk in staging by the time this runs, so no step here can fail
+    halfway on a network error. An earlier version downloaded latest.jpg
+    *after* replacing latest/ and latest.png, then reported "nothing changed"
+    when that download failed.
+    """
+    target = drop_dir()
+
+    published: list[Path] = []
+    for source, drop, variant in staged:
+        final = target / immutable_name(drop, variant)
+        os.replace(source, final)
+        published.append(final)
+
+    # Build the batch directory in staging, then swap it in.
+    batch_new = staging / "batch"
+    batch_new.mkdir()
+    for index, path in enumerate(published, start=1):
+        shutil.copy2(path, batch_new / f"{index:02d}-{path.name}")
+    _fsync_dir(batch_new)
+
+    batch_dir = target / "latest"
+    retired = target / ".latest.old"
+    shutil.rmtree(retired, ignore_errors=True)
+    if batch_dir.exists():
+        os.rename(batch_dir, retired)
+    os.rename(batch_new, batch_dir)
+    shutil.rmtree(retired, ignore_errors=True)
+
+    # Both companions are staged, so the pair can never end up describing two
+    # different images. A batch with no image at all leaves them alone.
+    if companions is not None:
+        for name in ("latest.jpg", "latest.png"):
+            if name in companions:
+                os.replace(companions[name], target / name)
+            else:
+                (target / name).unlink(missing_ok=True)
+
+    _fsync_dir(target)
+    return published
+
+
+def clean_leftovers() -> None:
+    """Remove debris a crashed pull left behind.
+
+    A crash can leave a .staging-* or .latest.old directory. The cursor is
+    written last, so it did not advance, and the next pull re-fetches the
+    batch — which is idempotent, because ids are immutable and the names
+    derive from them.
+    """
+    target = drop_dir()
+    if not target.exists():
+        return
+    for entry in target.iterdir():
+        if entry.is_dir() and (entry.name.startswith(".staging-")
+                               or entry.name == ".latest.old"):
+            shutil.rmtree(entry, ignore_errors=True)
+
+
+def pull(args, fail) -> int:
+    state_dir().mkdir(parents=True, exist_ok=True)
+    with open(state_dir() / "lock", "w") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        drops, cursor = collect(args, fail)
+        if not drops:
+            print("drop: nothing new", file=sys.stderr)
+            return 0
+
+        # Staging sits inside ~/drop so every later move is a rename within
+        # one filesystem. Under ~/.local/state it would silently become a
+        # cross-device copy whenever ~/drop is a separate mount.
+        drop_dir().mkdir(parents=True, exist_ok=True)
+        clean_leftovers()
+        staging = Path(tempfile.mkdtemp(dir=drop_dir(), prefix=".staging-"))
+        try:
+            staged = []
+            for drop in drops:
+                variant = primary_variant(drop, args.full)
+                temp = staging / f"{drop['id']}-{variant}"
+                fetch(drop["id"], variant, temp)
+                staged.append((temp, drop, variant))
+            companions = stage_companions(staging, staged)
+            published = publish(staged, staging, companions)
+        except (urllib.error.URLError, OSError) as error:
+            print(f"drop: pull failed, nothing changed: {error}", file=sys.stderr)
+            return 1
+        finally:
+            shutil.rmtree(staging, ignore_errors=True)
+
+        if cursor is not None:
+            write_cursor(cursor)
+
+        separator = "\0" if args.print0 else "\n"
+        sys.stdout.write(separator.join(str(p) for p in published) + separator)
+        print(f"drop: {len(published)} file(s) in {drop_dir()}", file=sys.stderr)
+        return 0
+
+
+# Last line of the file: build_parser() resolves `pull` by name, so the guard
+# must run after every definition it reaches.
+if __name__ == "__main__":
+    sys.exit(main())
