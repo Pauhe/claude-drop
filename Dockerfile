@@ -2,8 +2,10 @@ FROM python:3.13-slim
 
 WORKDIR /app
 
-# libheif is what pillow-heif needs at runtime to read iPhone photos.
+# libheif is what pillow-heif needs at runtime to read iPhone photos. The
+# upgrade pulls Debian security fixes that land before the next base-image tag.
 RUN apt-get update \
+ && apt-get upgrade -y --no-install-recommends \
  && apt-get install -y --no-install-recommends libheif1 \
  && rm -rf /var/lib/apt/lists/*
 
